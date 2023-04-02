@@ -18,27 +18,50 @@ contract DEX {
     using SafeMath for uint256; //outlines use of SafeMath for uint256 variables
     IERC20 token; //instantiates the imported contract
 
+    uint256 public totalLiquidity;
+    mapping(address => uint256) public liquidity;
+
     /* ========== EVENTS ========== */
 
     /**
      * @notice Emitted when ethToToken() swap transacted
      */
-    event EthToTokenSwap();
+    event EthToTokenSwap(
+        address swapper,
+        string txDetails,
+        uint256 ethInput,
+        uint256 tokenOutput
+    );
 
     /**
      * @notice Emitted when tokenToEth() swap transacted
      */
-    event TokenToEthSwap();
+    event TokenToEthSwap(
+        address swapper,
+        string txDetails,
+        uint256 tokensInput,
+        uint256 ethOutput
+    );
 
     /**
      * @notice Emitted when liquidity provided to DEX and mints LPTs.
      */
-    event LiquidityProvided();
+    event LiquidityProvided(
+        address liquidityProvider,
+        uint256 tokensInput,
+        uint256 ethInput,
+        uint256 liquidityMinted
+    );
 
     /**
      * @notice Emitted when liquidity removed from DEX and decreases LPT count within DEX.
      */
-    event LiquidityRemoved();
+    event LiquidityRemoved(
+        address liquidityRemover,
+        uint256 tokensOutput,
+        uint256 ethOutput,
+        uint256 liquidityWithdrawn
+    );
 
     /* ========== CONSTRUCTOR ========== */
 
@@ -54,7 +77,16 @@ contract DEX {
      * @return totalLiquidity is the number of LPTs minting as a result of deposits made to DEX contract
      * NOTE: since ratio is 1:1, this is fine to initialize the totalLiquidity (wrt to balloons) as equal to eth balance of contract.
      */
-    function init(uint256 tokens) public payable returns (uint256) {}
+    function init(uint256 tokens) public payable returns (uint256) {
+        require(totalLiquidity == 0, "DEX already has liquidity");
+        totalLiquidity = address(this).balance;
+        liquidity[msg.sender] = totalLiquidity;
+        require(
+            token.transferFrom(msg.sender, address(this), tokens),
+            "Transfer failed"
+        );
+        return totalLiquidity;
+    }
 
     /**
      * @notice returns yOutput, or yDelta for xInput (or xDelta)
@@ -64,7 +96,12 @@ contract DEX {
         uint256 xInput,
         uint256 xReserves,
         uint256 yReserves
-    ) public view returns (uint256 yOutput) {}
+    ) public view returns (uint256 yOutput) {
+        uint256 xInputWithFee = xInput.mul(997);
+        uint256 numerator = xInputWithFee.mul(yReserves);
+        uint256 denominator = (xReserves.mul(1000)).add(xInputWithFee);
+        return (numerator / denominator);
+    }
 
     /**
      * @notice returns liquidity for a user.
@@ -72,17 +109,50 @@ contract DEX {
      * NOTE: if you are using a mapping liquidity, then you can use `return liquidity[lp]` to get the liquidity for a user.
      * NOTE: if you will be submitting the challenge make sure to implement this function as it is used in the tests.
      */
-    function getLiquidity(address lp) public view returns (uint256) {}
+    function getLiquidity(address lp) public view returns (uint256) {
+        return liquidity[lp];
+    }
 
     /**
      * @notice sends Ether to DEX in exchange for $BAL
      */
-    function ethToToken() public payable returns (uint256 tokenOutput) {}
+    function ethToToken() public payable returns (uint256 tokenOutput) {
+        require(msg.value > 0);
+        tokenOutput = price(
+            msg.value,
+            address(this).balance.sub(msg.value),
+            token.balanceOf(address(this))
+        );
+        require(token.transfer(msg.sender, tokenOutput));
+        emit EthToTokenSwap(
+            msg.sender,
+            "Swap Eth to Balloons",
+            msg.value,
+            tokenOutput
+        );
+        return tokenOutput;
+    }
 
     /**
      * @notice sends $BAL tokens to DEX in exchange for Ether
      */
-    function tokenToEth(uint256 tokenInput) public returns (uint256 ethOutput) {}
+    function tokenToEth(uint256 tokenInput) public returns (uint256 ethOutput) {
+        require(tokenInput > 0);
+        ethOutput = price(
+            tokenInput,
+            token.balanceOf(address(this)),
+            address(this).balance
+        );
+        require(token.transferFrom(msg.sender, address(this), tokenInput));
+        payable(msg.sender).transfer(ethOutput);
+        emit TokenToEthSwap(
+            msg.sender,
+            "Swap Balloons to Eth",
+            tokenInput,
+            ethOutput
+        );
+        return ethOutput;
+    }
 
     /**
      * @notice allows deposits of $BAL and $ETH to liquidity pool
@@ -90,11 +160,45 @@ contract DEX {
      * NOTE: user has to make sure to give DEX approval to spend their tokens on their behalf by calling approve function prior to this function call.
      * NOTE: Equal parts of both assets will be removed from the user's wallet with respect to the price outlined by the AMM.
      */
-    function deposit() public payable returns (uint256 tokensDeposited) {}
+    function deposit() public payable returns (uint256 tokensDeposited) {
+        require(msg.value > 0);
+        tokensDeposited =
+            msg.value.mul(token.balanceOf(address(this))) /
+            address(this).balance.sub(msg.value);
+
+        require(token.transferFrom(msg.sender, address(this), tokensDeposited));
+
+        uint256 liquidityMinted = msg.value.mul(totalLiquidity) /
+            address(this).balance.sub(msg.value);
+        liquidity[msg.sender] = liquidity[msg.sender].add(liquidityMinted);
+        totalLiquidity = totalLiquidity.add(liquidityMinted);
+        emit LiquidityProvided(
+            msg.sender,
+            liquidityMinted,
+            msg.value,
+            tokensDeposited
+        );
+
+        return tokensDeposited;
+    }
 
     /**
      * @notice allows withdrawal of $BAL and $ETH from liquidity pool
      * NOTE: with this current code, the msg caller could end up getting very little back if the liquidity is super low in the pool. I guess they could see that with the UI.
      */
-    function withdraw(uint256 amount) public returns (uint256 eth_amount, uint256 token_amount) {}
+    function withdraw(
+        uint256 amount
+    ) public returns (uint256 eth_amount, uint256 token_amount) {
+        require(liquidity[msg.sender] >= amount);
+        eth_amount = amount.mul(address(this).balance) / totalLiquidity;
+        token_amount =
+            amount.mul(token.balanceOf(address(this))) /
+            totalLiquidity;
+        payable(msg.sender).transfer(eth_amount);
+        token.transfer(msg.sender, token_amount);
+        liquidity[msg.sender] -= amount;
+        totalLiquidity -= amount;
+        emit LiquidityRemoved(msg.sender, amount, eth_amount, token_amount);
+        return (eth_amount, token_amount);
+    }
 }
